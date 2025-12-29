@@ -18,6 +18,12 @@ contents of anchor keys in leaf nodes (i.e., high_key, the upper bound), while i
 to high_key, which makes FB+-tree more space-efficient. Since high_key only represents the upper bound of a leaf
 node, it can be constructed using discriminative prefixes to improve performance and space consumption.
 
+Check our [VLDB paper](https://www.vldb.org/pvldb/vol18/p1579-li.pdf) for more details:
+`````
+Yuan Chen, Ao Li, Wenhai Li, and Lingfeng Deng:
+FB+-tree: A Memory-Optimized B+-tree with Latch-Free Update. PVLDB 18(6): 1579-1592, 2025
+`````
+
 # Synchronization Protocol
 FB+-tree employs a highly optimized optimistic synchronization protocol for concurrent index access.
 It highlights:
