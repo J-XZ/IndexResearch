@@ -3,10 +3,23 @@
 #include <cassert>
 #include <cstring>
 #include <atomic>
-#include <immintrin.h>
 #include <sched.h>
 
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+
 namespace btreeolc {
+
+inline void cpu_relax() {
+#if defined(__aarch64__) || defined(__arm64__)
+  __asm__ __volatile__("yield");
+#elif defined(__x86_64__) || defined(__i386__)
+  _mm_pause();
+#else
+  std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+}
 
 enum class PageType : uint8_t { BTreeInner=1, BTreeLeaf=2 };
 
@@ -23,7 +36,7 @@ struct OptLock {
     uint64_t version;
     version = typeVersionLockObsolete.load();
     if (isLocked(version) || isObsolete(version)) {
-      _mm_pause();
+      cpu_relax();
       needRestart = true;
     }
     return version;
@@ -42,7 +55,7 @@ struct OptLock {
     if (typeVersionLockObsolete.compare_exchange_strong(version, version + 0b10)) {
       version = version + 0b10;
     } else {
-      _mm_pause();
+      cpu_relax();
       needRestart = true;
     }
   }
@@ -243,7 +256,7 @@ struct BTree {
     if (count>3)
       sched_yield();
     else
-      _mm_pause();
+      cpu_relax();
   }
 
   void insert(Key k, Value v) {

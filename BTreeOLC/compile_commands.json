@@ -1,0 +1,8 @@
+[
+{
+  "directory": "/Users/xuzhenjiang/Downloads/IndexResearch/BTreeOLC/build",
+  "command": "/usr/bin/c++   -g -std=gnu++17 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -o CMakeFiles/BTreeOLCExample.dir/example.cpp.o -c /Users/xuzhenjiang/Downloads/IndexResearch/BTreeOLC/example.cpp",
+  "file": "/Users/xuzhenjiang/Downloads/IndexResearch/BTreeOLC/example.cpp",
+  "output": "CMakeFiles/BTreeOLCExample.dir/example.cpp.o"
+}
+]
