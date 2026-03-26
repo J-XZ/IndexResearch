@@ -7,11 +7,20 @@ BUILD_DIR="${SCRIPT_DIR}/build"
 HOST_ARCH="$(uname -m)"
 HOST_OS="$(uname -s)"
 SDK_PATH=""
+CCACHE_BIN="$(command -v ccache || true)"
+CCACHE_DIR_PATH="${SCRIPT_DIR}/.ccache"
 
 CONFIG_ARGS=(
   -DCMAKE_BUILD_TYPE=Debug
   -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 )
+
+if [[ -n "${CCACHE_BIN}" ]]; then
+  export CCACHE_DIR="${CCACHE_DIR_PATH}"
+  mkdir -p "${CCACHE_DIR}"
+  CONFIG_ARGS+=(-DCMAKE_C_COMPILER_LAUNCHER="${CCACHE_BIN}")
+  CONFIG_ARGS+=(-DCMAKE_CXX_COMPILER_LAUNCHER="${CCACHE_BIN}")
+fi
 
 if [[ "${HOST_OS}" == "Darwin" ]]; then
   SDK_PATH="$(xcrun --show-sdk-path)"

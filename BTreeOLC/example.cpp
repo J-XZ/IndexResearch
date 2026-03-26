@@ -31,5 +31,9 @@ int main() {
     }
   }
 
+  std::string output[200];
+  auto scanned = tree.scan("1", 200, output);
+  std::cout << "scanned: " << scanned << std::endl;
+
   return 0;
 }

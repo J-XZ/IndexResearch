@@ -1,0 +1,14 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build BTreeOLCExample",
+      "type": "shell",
+      "command": "${workspaceFolder}/BTreeOLC/build.sh",
+      "options": {
+        "cwd": "${workspaceFolder}/BTreeOLC"
+      },
+      "problemMatcher": []
+    }
+  ]
+}

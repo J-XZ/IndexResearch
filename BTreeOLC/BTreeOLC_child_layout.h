@@ -24,6 +24,17 @@
 
 namespace btreeolc {
 
+/**
+ * @brief 轻量级自旋等待指令。
+ *
+ * 在并发冲突时，不会立刻陷入重量级阻塞，而是先执行一个非常短的
+ * “放松 CPU” 指令，降低忙等对流水线和功耗的影响。
+ *
+ * 不同架构使用不同实现：
+ * - ARM64: `yield`
+ * - x86: `_mm_pause()`
+ * - 其他平台：退化为编译器层面的栅栏
+ */
 inline void cpu_relax() {
 #if defined(__aarch64__) || defined(__arm64__)
   __asm__ __volatile__("yield");
@@ -34,12 +45,14 @@ inline void cpu_relax() {
 #endif
 }
 
+/// 节点类型：内部节点或叶子节点。
 enum class PageType : uint8_t { BTreeInner = 1, BTreeLeaf = 2 };
 
+/// 这里假设每个节点按 4KB 页大小组织，类似数据库/索引常见做法。
 static const uint64_t pageSize = 4 * 1024;
 
-/*
-B+ 树里每个节点自带的“乐观锁 + 版本号”组件。
+/**
+ * @brief B+ 树里每个节点自带的“乐观锁 + 版本号”组件。
 它不提供传统互斥锁语义，而是给节点维护一个 64 位状态字
 typeVersionLockObsolete，让读线程先乐观读取，最后再校验版本是否变化；
   写线程则通过 CAS 抢占写锁。
@@ -121,17 +134,49 @@ typeVersionLockObsolete，让读线程先乐观读取，最后再校验版本是
   - 冲突时靠 restart 重试
 */
 struct OptLock {
+  /**
+   * 这个 64 位状态字同时承载三类信息：
+   * - bit0: obsolete，节点是否已失效
+   * - bit1: locked，节点是否正被写线程持有
+   * - 高位: version，节点版本号
+   *
+   * 初始值 0b100 的含义是：
+   * - locked = 0
+   * - obsolete = 0
+   * - version 从一个非零值开始
+   */
   std::atomic<uint64_t> typeVersionLockObsolete{0b100};
 
+  /**
+   * @brief 检查节点版本号的第二低位是否为 1，表示节点当前被加锁
+   *
+   * @param version 节点的版本号
+   * @return true 节点被加锁
+   * @return false 节点未被加锁
+   */
   bool isLocked(uint64_t version) { return ((version & 0b10) == 0b10); }
 
+  /**
+   * @brief 乐观读入口。
+   *
+   * 它并不真正“加读锁”，而是读一次状态字：
+   * - 如果节点当前正被写线程修改，或者已经 obsolete，则要求上层重试
+   * - 否则返回当前版本号，调用方在读取节点内容后再做一次版本校验
+   */
   uint64_t readLockOrRestart(bool &needRestart) {
+    // 读取节点的版本号值
     uint64_t version;
     version = typeVersionLockObsolete.load();
+
+    // 如果节点当前被写线程持有，或者已经废弃了，
+    // 就说明除了调用方之外还有其他线程正在修改这个节点，当前线程的读取结果可能不一致，必须重试。
+    // 这里调用方线程会通过cpu_relax()先短暂等待一下，降低忙等对 CPU 的影响，
+    // 然后把 needRestart 标记为 true，通知调用方重试。
     if (isLocked(version) || isObsolete(version)) {
       cpu_relax();
       needRestart = true;
     }
+
     return version;
   }
 
@@ -144,6 +189,13 @@ struct OptLock {
     if (needRestart) return;
   }
 
+  /**
+   * @brief 将“我刚才读到的那个版本”升级为写锁。
+   *
+   * 这里依赖 CAS：
+   * - 若状态仍是我先前看到的 version，说明期间没人改过它，可以安全加写锁
+   * - 若 CAS 失败，说明发生并发竞争，调用方必须整次操作重试
+   */
   void upgradeToWriteLockOrRestart(uint64_t &version, bool &needRestart) {
     if (typeVersionLockObsolete.compare_exchange_strong(version,
                                                         version + 0b10)) {
@@ -158,14 +210,23 @@ struct OptLock {
 
   bool isObsolete(uint64_t version) { return (version & 1) == 1; }
 
+  /// 语义化包装：本质上就是“读完后校验版本是否没变”。
   void checkOrRestart(uint64_t startRead, bool &needRestart) const {
     readUnlockOrRestart(startRead, needRestart);
   }
 
+  /**
+   * @brief 读路径的收尾检查。
+   *
+   * 如果开始读节点时拿到的版本号，与当前版本不同，
+   * 就说明本次读取期间该节点被并发修改过，当前结果不能信任，必须重试。
+   */
   void readUnlockOrRestart(uint64_t startRead, bool &needRestart) const {
     needRestart = (startRead != typeVersionLockObsolete.load());
   }
 
+  /// 解除写锁并顺便把节点标记为
+  /// obsolete。当前文件里预留了这个能力，但几乎没实际用到。
   void writeUnlockObsolete() { typeVersionLockObsolete.fetch_add(0b11); }
 };
 
@@ -184,12 +245,21 @@ struct NodeBase : public OptLock {
 };
 
 /**
- * @brief 在NodeBase的基础上定义了一个静态常量
+ * @brief 叶节点：
+ * 在NodeBase的基础上定义了一个静态常量
  * typeMarker，表示这是一个叶子节点。
- *
  */
 struct BTreeLeafBase : public NodeBase {
   static const PageType typeMarker = PageType::BTreeLeaf;
+};
+
+/**
+ * @brief 内部节点：
+ * 在NodeBase的基础上定义了一个静态常量
+ * typeMarker，表示这是一个内部节点。
+ */
+struct BTreeInnerBase : public NodeBase {
+  static const PageType typeMarker = PageType::BTreeInner;
 };
 
 /**
@@ -206,10 +276,12 @@ struct BTreeLeaf : public BTreeLeafBase {
   // 这是叶子节点存储的元素类型：一个键值对
   using KeyValueType = std::pair<Key, Payload>;
 
+  // 叶子节点能容纳多少元素，取决于页大小减去公共头部之后剩余的空间。
   static const uint64_t maxEntries =
       (pageSize - sizeof(NodeBase)) / (sizeof(KeyValueType));
 
   // 这是我们进行搜索的数组，存储了实际的键值对
+  // 这个实现没有做键值分离，所以键和值的布局是交错的，存储在同一个数组里
   KeyValueType data[maxEntries];
 
   BTreeLeaf() {
@@ -219,6 +291,15 @@ struct BTreeLeaf : public BTreeLeafBase {
 
   bool isFull() { return count == maxEntries; };
 
+  /**
+   * @brief 在有序叶子数组中做 lower_bound。
+   *
+   * 返回值语义与 STL 的 lower_bound 一致：
+   * - 若找到相等 key，返回其位置
+   * - 否则返回“第一个大于 k 的位置”
+   *
+   * 这个位置既可用于 lookup，也可直接用于 insert 时决定新元素插入点。
+   */
   unsigned lowerBound(Key k) {
     unsigned lower = 0;
     unsigned upper = count;
@@ -238,9 +319,19 @@ struct BTreeLeaf : public BTreeLeafBase {
     return lower;
   }
 
+  /**
+   * @brief 向叶子节点插入一个键值对。
+   *
+   * 这里的语义是 upsert：
+   * - 若 key 已存在，则覆盖 value
+   * - 若 key 不存在，则保持有序地插入新元素
+   *
+   * 由于数据布局是 `pair<Key, Payload>` 数组，所以一次 `memmove`
+   * 即可整体挪动键和值。
+   */
   void insert(Key k, Payload p) {
     assert(count < maxEntries);
-    if (count) {
+    if (count) {  // 如果当前叶子非空，找到要插入的位置，搬运数组中的元素，然后插入
       unsigned pos = lowerBound(k);
       if ((pos < count) && (data[pos].first == k)) {
         // Upsert
@@ -251,13 +342,24 @@ struct BTreeLeaf : public BTreeLeafBase {
       // memmove(payloads+pos+1,payloads+pos,sizeof(Payload)*(count-pos));
       data[pos].first = k;
       data[pos].second = p;
-    } else {
+    } else {  // 否则直接插入一个元素
       data[0].first = k;
       data[0].second = p;
     }
     count++;
   }
 
+  /**
+   * @brief 分裂叶子节点。
+   *
+   * 分裂策略：
+   * - 新建一个右侧叶子 `newLeaf`
+   * - 将后半部分元素拷贝到新叶子
+   * - 当前叶子保留前半部分
+   * - `sep` 输出为左叶子最后一个 key，用作插入父节点的分隔键
+   *
+   * 这是 B+ 树插入时的核心步骤之一。
+   */
   BTreeLeaf *split(Key &sep) {
     BTreeLeaf *newLeaf = new BTreeLeaf();
     newLeaf->count = count - (count / 2);
@@ -265,19 +367,29 @@ struct BTreeLeaf : public BTreeLeafBase {
     memcpy(newLeaf->data, data + count, sizeof(KeyValueType) * newLeaf->count);
     // memcpy(newLeaf->payloads, payloads+count,
     // sizeof(Payload)*newLeaf->count);
+    // 叶子节点分裂以后产生1个分隔键，是分裂后左侧节点中的最大键
     sep = data[count - 1].first;
     return newLeaf;
   }
 };
 
-struct BTreeInnerBase : public NodeBase {
-  static const PageType typeMarker = PageType::BTreeInner;
-};
-
+/**
+ * @brief 继承 BTreeInnerBase，
+ * 并且添加了一个静态常量maxEntries，表示每个内部节点最多能存储多少个分隔键。
+ * 另外包含一个 children 数组，存储指向子节点的指针，
+ * 以及一个 keys 数组，存储分隔键。
+ *
+ * 备注：children 数组的大小是 maxEntries + 1，
+ * 因为一个内部节点有 count 个分隔键，对应 count + 1 个子节点指针。
+ *
+ * @tparam Key
+ */
 template <class Key>
 struct BTreeInner : public BTreeInnerBase {
+  // 内部节点中有 count 个 key，对应 count + 1 个 child pointer。
   static const uint64_t maxEntries =
       (pageSize - sizeof(NodeBase)) / (sizeof(Key) + sizeof(NodeBase *));
+
   NodeBase *children[maxEntries];
   Key keys[maxEntries];
 
@@ -288,6 +400,11 @@ struct BTreeInner : public BTreeInnerBase {
 
   bool isFull() { return count == (maxEntries - 1); };
 
+  /**
+   * @brief 一个分支预测更友好的 lower_bound 变体。
+   *
+   * 当前实现里没有实际使用它，保留在这里只是提供另一种节点内搜索写法。
+   */
   unsigned lowerBoundBF(Key k) {
     auto base = keys;
     unsigned n = count;
@@ -299,6 +416,13 @@ struct BTreeInner : public BTreeInnerBase {
     return (*base < k) + base - keys;
   }
 
+  /**
+   * @brief 在内部节点的分隔键数组上做二分搜索。
+   *
+   * 返回的位置既可用于：
+   * - 查找下一跳 child
+   * - 向内部节点插入新的分隔键
+   */
   unsigned lowerBound(Key k) {
     unsigned lower = 0;
     unsigned upper = count;
@@ -315,6 +439,13 @@ struct BTreeInner : public BTreeInnerBase {
     return lower;
   }
 
+  /**
+   * @brief 分裂内部节点。
+   *
+   * 与叶子分裂不同，内部节点分裂时：
+   * - 中间那个 key 会“上推”给父节点，保存在 `sep`
+   * - 左右两个内部节点都不再保留这个被上推的 key
+   */
   BTreeInner *split(Key &sep) {
     BTreeInner *newInner = new BTreeInner();
     newInner->count = count - (count / 2);
@@ -327,6 +458,13 @@ struct BTreeInner : public BTreeInnerBase {
     return newInner;
   }
 
+  /**
+   * @brief 向内部节点插入一个新的分隔键和右孩子指针。
+   *
+   * 插入完成后要维护 B+ 树内部节点的经典关系：
+   * - keys 有序
+   * - children 数量始终比 keys 多 1
+   */
   void insert(Key k, NodeBase *child) {
     assert(count < maxEntries - 1);
     unsigned pos = lowerBound(k);
@@ -342,10 +480,19 @@ struct BTreeInner : public BTreeInnerBase {
 
 template <class Key, class Value>
 struct BTree {
+  /// root 也做成原子变量，是为了让根分裂时的替换对并发线程可见。
   std::atomic<NodeBase *> root;
 
   BTree() { root = new BTreeLeaf<Key, Value>(); }
 
+  /**
+   * @brief 当根节点分裂时创建一个全新的根。
+   *
+   * 分裂前树高为 h，分裂后树高增加为 h + 1：
+   * - 左孩子指向旧根
+   * - 右孩子指向新分裂出的节点
+   * - 中间的分隔键放在新根里
+   */
   void makeRoot(Key k, NodeBase *leftChild, NodeBase *rightChild) {
     auto inner = new BTreeInner<Key>();
     inner->count = 1;
@@ -384,9 +531,12 @@ struct BTree {
       bool needRestart = false;
       bool restart = false;
 
-      // Current node
+      // 从根节点开始，准备进行一次完整的“乐观遍历 + 必要时重试”
       NodeBase *node = root;
-      uint64_t versionNode = node->readLockOrRestart(needRestart);
+      uint64_t nodeVersion = node->readLockOrRestart(needRestart);
+
+      // 如果需要重试，或者在读版本时发现根节点已经被替换了，
+      // 就要从头开始重试整个插入过程
       if (needRestart || (node != root)) {
         continue;
       }
@@ -395,10 +545,12 @@ struct BTree {
       BTreeInner<Key> *parent = nullptr;
       uint64_t versionParent = 0;
 
+      // 先在inner节点上一路向下走，直到到达叶子节点。
       while (node->type == PageType::BTreeInner) {
         auto inner = static_cast<BTreeInner<Key> *>(node);
 
-        // Split eagerly if full
+        // 采用“eager split”策略：沿路向下时，若发现内部节点已满，先分裂再继续。
+        // 这样到达叶子后，通常就不需要回溯向上调整父节点了。
         if (inner->isFull()) {
           if (parent) {
             parent->upgradeToWriteLockOrRestart(versionParent, needRestart);
@@ -407,7 +559,7 @@ struct BTree {
               break;
             }
           }
-          node->upgradeToWriteLockOrRestart(versionNode, needRestart);
+          node->upgradeToWriteLockOrRestart(nodeVersion, needRestart);
           if (needRestart) {
             if (parent) {
               parent->writeUnlock();
@@ -420,6 +572,8 @@ struct BTree {
             restart = true;
             break;
           }
+
+          // 分裂当前内部节点，并将分隔键插入父节点；如果当前就是根，则新建根。
           Key sep;
           BTreeInner<Key> *newInner = inner->split(sep);
           if (parent) {
@@ -444,52 +598,85 @@ struct BTree {
         }
 
         parent = inner;
-        versionParent = versionNode;
+        versionParent = nodeVersion;
 
+        // 根据 key 在内部节点中选择下一跳 child。
         node = inner->children[inner->lowerBound(k)];
-        inner->checkOrRestart(versionNode, needRestart);
+        inner->checkOrRestart(nodeVersion, needRestart);
         if (needRestart) {
           restart = true;
           break;
         }
-        versionNode = node->readLockOrRestart(needRestart);
+        nodeVersion = node->readLockOrRestart(needRestart);
         if (needRestart) {
           restart = true;
           break;
         }
       }
+
+      // 在内部节点遍历的过程中，如果任何一步需要重试，我们都直接设置 restart
+      // 标记并跳出循环， 最后在外层根据 restart 标记决定是否重试整个插入过程。
+
+      // 在遍历内部节点的过程中，会维护最后访问到的叶子节点的父节点指针 parent
+      // 和版本号 versionParent
 
       if (restart) {
         continue;
       }
 
+      // 走到这里说明已经到达叶子节点。
       auto leaf = static_cast<BTreeLeaf<Key, Value> *>(node);
 
+      // 叶子满了则先分裂，分裂成功后整次操作重试。
+      // 重试后会沿着最新树结构重新找到正确叶子。
+
+      // 如果叶子满了
       if (leaf->count == leaf->maxEntries) {
-        if (parent) {
+        if (parent) {  // 如果这个叶子节点有父节点，就先尝试锁住父节点，准备修改它的分隔键和孩子指针
           parent->upgradeToWriteLockOrRestart(versionParent, needRestart);
           if (needRestart) {
             continue;
           }
         }
-        node->upgradeToWriteLockOrRestart(versionNode, needRestart);
+
+        // 锁住当前叶子节点，准备分裂它
+        node->upgradeToWriteLockOrRestart(nodeVersion, needRestart);
+
         if (needRestart) {
+          // 如果尝试锁住当前叶子节点失败了，说明期间有其他线程修改过它，我们就直接重试整个插入过程。
+          // 别忘了如果之前锁住了父节点，要先解锁父节点。
           if (parent) {
             parent->writeUnlock();
           }
           continue;
         }
+
+        // 如果当前线程本来以为自己处理的是根节点，但在它准备修改这个节点时，
+        // 发现树的根已经被别的线程换掉了，所以这次操作不能继续，必须释放锁并重试。
         if (!parent && (node != root)) {  // there's a new parent
           node->writeUnlock();
           continue;
         }
+
+        // 排除了上述各种冲突和竞争情况后，当前线程成功锁住了需要分裂的叶子节点（以及它的父节点，如果有的话），
+        // 可以安全地进行分裂操作了。
+
         Key sep;
         BTreeLeaf<Key, Value> *newLeaf = leaf->split(sep);
+
+        // 如果当前要分裂的叶子节点有父节点，就把分隔键和新叶子插入父节点；
+        // 如果没有父节点，说明当前叶子就是根，分裂后需要新建一个根。
         if (parent) {
           parent->insert(sep, newLeaf);
         } else {
+          // 创建根节点的过程其实就是创建一个内部节点，
+          // 这个内部节点有两个指向孩子节点的指针和一个分隔键
+          // 分隔键等于左侧孩子节点的最大键。
+          // 这里的分割键类似平衡二叉树中内部节点的值
+          // 所有的左孩子都小于等于这个值，右孩子都大于这个值
           makeRoot(sep, leaf, newLeaf);
         }
+
         node->writeUnlock();
         if (parent) {
           parent->writeUnlock();
@@ -497,8 +684,8 @@ struct BTree {
         continue;
       }
 
-      // only lock leaf node
-      node->upgradeToWriteLockOrRestart(versionNode, needRestart);
+      // 叶子未满时，只需锁住叶子本身即可完成插入，父节点保持乐观读验证。
+      node->upgradeToWriteLockOrRestart(nodeVersion, needRestart);
       if (needRestart) {
         continue;
       }
@@ -509,8 +696,13 @@ struct BTree {
           continue;
         }
       }
+
+      // 实际在一个叶子中插入kv。
       leaf->insert(k, v);
+
+      // 解锁叶子节点
       node->writeUnlock();
+
       return;  // success
     }
   }
@@ -522,6 +714,7 @@ struct BTree {
       bool needRestart = false;
       bool restart = false;
 
+      // lookup 是纯读路径：一路乐观读下去，最后通过版本校验确认中途没被修改。
       NodeBase *node = root;
       uint64_t versionNode = node->readLockOrRestart(needRestart);
       if (needRestart || (node != root)) {
@@ -563,6 +756,7 @@ struct BTree {
         continue;
       }
 
+      // 到达叶子后，做一次节点内二分查找。
       BTreeLeaf<Key, Value> *leaf = static_cast<BTreeLeaf<Key, Value> *>(node);
       unsigned pos = leaf->lowerBound(k);
       bool success = false;
@@ -588,10 +782,15 @@ struct BTree {
   uint64_t scan(Key k, int range, Value *output) {
     int restartCount = 0;
     while (true) {
-      if (restartCount++) yield(restartCount);
+      if (restartCount++) {
+        yield(restartCount);
+      }
       bool needRestart = false;
       bool restart = false;
 
+      // scan 先像 lookup 一样定位到包含 lower bound 的叶子，
+      // 然后在当前实现里只扫描这个叶子内部的连续元素。
+      // 注意：这里不是完整跨叶链表的范围扫描，只是单叶扫描。
       NodeBase *node = root;
       uint64_t versionNode = node->readLockOrRestart(needRestart);
       if (needRestart || (node != root)) {
@@ -637,7 +836,9 @@ struct BTree {
       unsigned pos = leaf->lowerBound(k);
       int count = 0;
       for (unsigned i = pos; i < leaf->count; i++) {
-        if (count == range) break;
+        if (count == range) {
+          break;
+        }
         output[count++] = leaf->data[i].second;
       }
 
