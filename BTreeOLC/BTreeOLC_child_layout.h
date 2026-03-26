@@ -352,17 +352,34 @@ struct BTree {
     root = inner;
   }
 
+  /**
+   * @brief 在适当的时候调用 yield()，让出 CPU 给其他线程，避免长时间占用 CPU
+   * 导致饥饿。
+   *
+   * @param count 当前线程已经重试的次数，根据这个次数来决定是否调用
+   * sched_yield() 或者 cpu_relax()。
+   */
   void yield(int count) {
-    if (count > 3)
+    // 如果重试次数超过 3 次，就调用 sched_yield() 让出 CPU 给其他线程
+    if (count > 3) {
       sched_yield();
-    else
+    } else {
+      // 否则调用 cpu_relax() 进行短暂的忙等待，减少自旋对 CPU 的影响
       cpu_relax();
+    }
   }
 
   void insert(Key k, Value v) {
     int restartCount = 0;
+
   restart:
-    if (restartCount++) yield(restartCount);
+
+    if (restartCount++) {  // 如果不是第一次尝试插入，
+                           // 就调用 yield() 让出 CPU 或者进行短暂的忙等待
+                           // 第一次显然不应该等待，因为根本没有冲突，直接尝试插入就好
+      yield(restartCount);
+    }
+
     bool needRestart = false;
 
     // Current node
@@ -469,7 +486,9 @@ struct BTree {
 
   bool lookup(Key k, Value &result) {
     int restartCount = 0;
+
   restart:
+
     if (restartCount++) yield(restartCount);
     bool needRestart = false;
 
@@ -518,7 +537,9 @@ struct BTree {
 
   uint64_t scan(Key k, int range, Value *output) {
     int restartCount = 0;
+
   restart:
+
     if (restartCount++) yield(restartCount);
     bool needRestart = false;
 
