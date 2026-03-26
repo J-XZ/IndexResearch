@@ -1,8 +1,11 @@
-/*
+/**
  * BTreeOLC_child_layout.h - This file contains a modified version that
  *                           uses the key-value pair layout
  *
  * We use this to test whether child node layout will affect performance
+ *
+ * 这个文件包含一个修改版本的 B+ 树实现，
+ * 使用了键值对的布局。我们用它来测试子节点布局是否会影响性能。
  */
 
 #pragma once
